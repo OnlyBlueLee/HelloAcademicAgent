@@ -92,8 +92,8 @@
 ### 2. 安装
 
 ```bash
-git clone <repository-url>
-cd YYHDBL-HelloCodeAgentCli
+git clone https://github.com/OnlyBlueLee/HelloAcademicAgent.git
+cd HelloAcademicAgent
 
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
@@ -274,7 +274,7 @@ CLI 参数只有 `--repo` 与 `--project`，其余全部走 `.env` / 环境变�
 ## 项目结构
 
 ```
-YYHDBL-HelloCodeAgentCli/
+HelloAcademicAgent/
 ├── code_agent/                     # 主应用
 │   ├── hello_code_cli.py           # CLI 入口：斜杠命令 + 补丁提取/确认/应用
 │   ├── modes.py                    # 模式层：MODES / SUBAGENTS / ModeManager
