@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment
+.env
+.env.local
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Agent 运行状态目录（笔记/会话/备份/向量库），属本地数据不上传
+.helloagents/
+# 论文库 PDF（/research 下载的本地数据）
+papers/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Data
+data/
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model files
+*.pth
+*.pt
+*.ckpt
+models/checkpoints/
+
+# Submission helper files (for reference only, not to be committed to hello-agents)
+PR.md
+提交文件说明.md
