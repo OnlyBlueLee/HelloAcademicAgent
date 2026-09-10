@@ -88,6 +88,93 @@ class _NoQdrantLocalNoise(logging.Filter):
         return "Payload indexes have no effect" not in record.getMessage()
 
 
+def _run_doctor(agent, llm) -> None:
+    """健康自检：把此前"静默降级/假成功"的环节显式暴露出来。"""
+    print(c("\n🩺 自检开始", PRIMARY))
+    ok = True
+
+    # 1) LLM：必须返回非空内容（推理模型的 reasoning token 也占用 max_tokens，
+    #    只给 1~5 个 token 时会返回空串，看起来却"通过"）。
+    try:
+        r = llm.invoke([{"role": "user", "content": "回复：ok"}], max_tokens=512)
+        if (r or "").strip():
+            print(c("  ✅ LLM 连通，返回非空", INFO))
+        else:
+            ok = False
+            print(c("  ❌ LLM 返回空内容（可能 token 预算过小或模型为推理型）", ERROR))
+    except Exception as e:
+        ok = False
+        print(c(f"  ❌ LLM 调用失败: {e}", ERROR))
+
+    # 2) Embedding：实时 encode 一条，确认后端可用与维度
+    try:
+        from memory.embedding import get_text_embedder
+        emb = get_text_embedder()
+        v = emb.encode("health_check")
+        print(c(f"  ✅ Embedding 可用: {type(emb).__name__} dim={len(v)}", INFO))
+    except Exception as e:
+        ok = False
+        print(c(f"  ❌ Embedding 不可用: {e}", ERROR))
+
+    # 3) 向量库 import（此前 SearchRequest 会让 QDRANT_AVAILABLE 误判为 False）
+    try:
+        from memory.storage.qdrant_store import QDRANT_AVAILABLE
+        if QDRANT_AVAILABLE:
+            print(c("  ✅ 向量库(qdrant)可用", INFO))
+        else:
+            ok = False
+            print(c("  ❌ 向量库(qdrant)不可用（依赖未装或版本不兼容）", ERROR))
+    except Exception as e:
+        ok = False
+        print(c(f"  ❌ 向量库导入失败: {e}", ERROR))
+
+    # 4) PDF 解析依赖
+    try:
+        from markitdown import MarkItDown  # noqa: F401
+        print(c("  ✅ PDF/文档解析(markitdown)可用", INFO))
+    except Exception:
+        ok = False
+        print(c("  ❌ markitdown 未安装：PDF 将无法解析（pip install 'markitdown[pdf]'）", ERROR))
+
+    # 5) 各主题库的向量健康度：零向量意味着"入库成功但检索必失真"
+    try:
+        from tools.builtin.paper_rag_tool import PaperRagTool
+        tool = agent.paper_rag_tool
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        store = tool._get_store()
+        pts, _ = store.client.scroll(
+            collection_name=store.collection_name, limit=5000,
+            with_payload=True, with_vectors=True,
+        )
+        by_ns: dict = {}
+        for p in pts:
+            ns = (p.payload or {}).get("rag_namespace", "(none)")
+            vec = p.vector
+            if isinstance(vec, dict):
+                vec = list(vec.values())[0]
+            try:
+                import math
+                norm = math.sqrt(sum(float(x) * float(x) for x in vec))
+            except Exception:
+                norm = 0.0
+            d = by_ns.setdefault(ns, {"n": 0, "zero": 0})
+            d["n"] += 1
+            if norm < 1e-6:
+                d["zero"] += 1
+        if not by_ns:
+            print(c("  ℹ️ 向量库为空（还没有任何主题库入库）", INFO))
+        for ns, d in sorted(by_ns.items()):
+            if d["zero"]:
+                ok = False
+                print(c(f"  ❌ 主题库 '{ns}': {d['n']} 个片段中有 {d['zero']} 个零向量（检索会失真，需重新入库）", ERROR))
+            else:
+                print(c(f"  ✅ 主题库 '{ns}': {d['n']} 个片段，向量均正常", INFO))
+    except Exception as e:
+        print(c(f"  ⚠️ 主题库巡检跳过: {e}", WARN))
+
+    print(c("🩺 自检完成：" + ("全部通过" if ok else "存在问题，见上方 ❌"), PRIMARY if ok else ERROR))
+
+
 def main(argv: list[str] | None = None) -> int:
     """
     CLI 入口点。
@@ -121,8 +208,12 @@ def main(argv: list[str] | None = None) -> int:
     print(c(hr("=", 80), INFO))
 
     # Optional preflight to surface auth issues early.
+    # 注意：max_tokens 不能给 1 —— 推理型模型（如 deepseek-v4-flash）的 reasoning
+    # token 也计入该预算（实测 <128 就会返回空内容却"看起来通过"）。这里要求非空。
     try:
-        _ = llm.invoke([{"role": "user", "content": "ping"}], max_tokens=1)
+        _pre = llm.invoke([{"role": "user", "content": "ping"}], max_tokens=512)
+        if not (_pre or "").strip():
+            print(c("LLM 预检返回空内容：可能是推理型模型 token 预算不足，或配置异常。", WARN))
     except HelloAgentsException as e:
         print(c("LLM 预检失败（通常是 API key/base_url/model 配置问题）。", ERROR))
         print(c(f"error: {e}", ERROR))
@@ -140,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         print(c("  /code", ACCENT) + c("      代码助手模式：部署开源代码 / 辅助复现", INFO))
         print(c("  /lib <topic>", ACCENT) + c("  切换当前主题库（论文按库隔离）", INFO))
         print(c("  /status", ACCENT) + c("    查看当前模式与主题库", INFO))
+        print(c("  /doctor", ACCENT) + c("    健康自检：LLM/向量库/embedding/零向量", INFO))
         print(c("  /plan <目标>", ACCENT) + c("  强制生成计划", INFO))
         print(c("  /help", ACCENT) + c("      显示本帮助", INFO))
         print(c("  /quit", ACCENT) + c("      退出", INFO))
@@ -179,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(c(agent.set_topic(arg), PRIMARY))
             elif cmd == "/status":
                 print(c(agent.current_mode(), ACCENT))
+            elif cmd == "/doctor":
+                _run_doctor(agent, llm)
             elif cmd == "/help":
                 _print_help()
             elif cmd == "/plan":

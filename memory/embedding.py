@@ -214,6 +214,11 @@ class DashScopeEmbedding(EmbeddingModel):
         if not embeddings_obj:
             raise RuntimeError("DashScope 返回为空或格式不匹配")
         vecs = [np.array(item.get("embedding") or item.get("vector")) for item in embeddings_obj]
+        if len(vecs) != len(inputs):
+            raise RuntimeError(
+                f"DashScope 返回数量不符: 请求 {len(inputs)} 条, 返回 {len(vecs)} 条"
+                "（text-embedding-v3 单次最多 10 条，请减小批次）"
+            )
         if single:
             return vecs[0]
         return vecs

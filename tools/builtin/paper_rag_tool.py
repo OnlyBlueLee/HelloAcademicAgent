@@ -12,6 +12,7 @@ import os
 from typing import Dict, Any, List
 
 from ..base import Tool, ToolParameter
+from utils.topic import sanitize_topic
 
 
 class PaperRagTool(Tool):
@@ -64,7 +65,8 @@ class PaperRagTool(Tool):
     # ---------- 内部辅助 ----------
     def _resolve_topic(self, params: Dict[str, Any]) -> str:
         t = params.get("topic") or getattr(self.session_state, "current_topic", None) or "default"
-        return str(t).strip() or "default"
+        # 与 arxiv 工具/CLI 共用同一清洗规则，避免目录名与 namespace 不一致。
+        return sanitize_topic(t)
 
     def _get_store(self):
         """惰性获取单一 Qdrant store（连接管理器单例，兼容嵌入式本地/服务/云）。"""
@@ -147,7 +149,13 @@ class PaperRagTool(Tool):
                 store=store, query=query, top_k=pool, rag_namespace=topic, only_rag_data=True,
             )
         if not hits:
-            return f"🔍 主题库 '{topic}' 中没有检索到相关内容（确认已 index，且 topic 一致）"
+            current = sanitize_topic(getattr(self.session_state, "current_topic", None))
+            hint = (
+                f"当前主题库是 '{current}'；若你传的 topic 与入库时不同，请改用 list 确认。"
+                if topic != current else
+                "该库可能尚未入库：可先用 list 查看，或在 /research 下载后用 index 入库。"
+            )
+            return f"🔍 主题库 '{topic}' 中没有检索到相关内容。{hint}"
         graph = compute_graph_signals_from_pool(hits)
         ranked = rank(hits, graph)
         text = merge_snippets_grouped(ranked[: top_k * 2], max_chars=2500, include_citations=True)

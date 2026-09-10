@@ -13,6 +13,47 @@ from pathlib import Path
 from typing import Dict, Any, List
 
 from ..base import Tool, ToolParameter
+from utils.topic import sanitize_topic
+
+
+# arxiv API 的查询语法中，裸词按 OR/松散匹配处理。过去把自然语言原样拼进
+# `cat:X AND (query)`，配 sort_by=SubmittedDate 时就等于"把该分类最新投稿里
+# 沾到任一词的全捞出来"，返回大量无关论文（实测会把世界模型/水稻分类当成
+# "遥感 VLM"）。这里对自然语言查询逐词加引号并用 AND 连接，保证命中所有词。
+_QUERY_RAW_RE = re.compile(r":|\b(?:AND|OR|ANDNOT)\b", re.IGNORECASE)
+_STOPWORDS = {
+    "a", "an", "the", "of", "for", "in", "on", "with", "about", "to", "and",
+    "or", "using", "based", "recent", "latest", "new", "paper", "papers",
+    "article", "articles", "study", "studies",
+}
+
+
+def build_arxiv_query(query: str, category: str = "") -> str:
+    """把自然语言查询转成 arxiv 检索式。
+
+    - 输入已含 arxiv 语法（字段前缀 / AND / OR）时原样透传，尊重调用方意图；
+      若其中已自带 cat: 限定，则不再重复包裹 category。
+    - 否则逐词加引号并用 AND 连接（去掉常见停用词），显著提升精确度。
+    """
+    q = (query or "").strip()
+    if not q:
+        return ""
+    if _QUERY_RAW_RE.search(q):
+        if re.search(r"\bcat:", q, re.IGNORECASE) or not category:
+            return q
+        return f"cat:{category} AND ({q})"
+    terms = []
+    for tok in re.findall(r'"[^"]*"|\S+', q):
+        if tok.startswith('"') and tok.endswith('"'):
+            terms.append(tok)
+        else:
+            t = tok.strip().rstrip(",").strip()
+            if t and t.lower() not in _STOPWORDS:
+                terms.append(f'"{t}"')
+    if not terms:
+        terms = [f'"{q}"']
+    expr = " AND ".join(terms)
+    return f"cat:{category} AND ({expr})" if category else expr
 
 
 class ArxivTool(Tool):
@@ -72,21 +113,23 @@ class ArxivTool(Tool):
 
     def _resolve_topic(self, params: Dict[str, Any]) -> str:
         t = params.get("topic") or getattr(self.session_state, "current_topic", None) or "default"
-        t = re.sub(r"[^A-Za-z0-9_\-\.]", "_", str(t).strip())
-        return t or "default"
+        return sanitize_topic(t)
 
     def _fmt(self, r) -> str:
         authors_list = list(getattr(r, "authors", []) or [])
         authors = ", ".join(a.name for a in authors_list[:4])
         if len(authors_list) > 4:
             authors += " et al."
-        year = getattr(getattr(r, "published", None), "year", "")
+        published = getattr(r, "published", None)
+        # 暴露完整提交日期：只给年份时模型无法判断"最近一篇"，只能靠 arxiv ID 猜月份（易错一年）。
+        published_str = published.strftime("%Y-%m-%d") if published else "unknown"
+        year = getattr(published, "year", "")
         sid = r.get_short_id()
         cats = ",".join(getattr(r, "categories", []) or [])
         summary = re.sub(r"\s+", " ", (getattr(r, "summary", "") or "")).strip()
         return (
             f"[{sid}] {r.title}\n"
-            f"    作者: {authors} | {year} | {cats}\n"
+            f"    作者: {authors} | 提交: {published_str} ({year}) | {cats}\n"
             f"    摘要: {summary[:300]}...\n"
             f"    PDF: {r.pdf_url}"
         )
@@ -132,7 +175,7 @@ class ArxivTool(Tool):
             "lastupdateddate": arxiv.SortCriterion.LastUpdatedDate,
             "submitteddate": arxiv.SortCriterion.SubmittedDate,
         }.get(sort_name, arxiv.SortCriterion.Relevance)
-        q = f"cat:{category} AND ({query})" if category else query
+        q = build_arxiv_query(query, category or "")
         s = arxiv.Search(
             query=q,
             max_results=max_results,
@@ -150,8 +193,8 @@ class ArxivTool(Tool):
                 pass
         if not results:
             extra = f", sort_by={sort_name}" + (f", since_days={since_days}" if since_days else "")
-            return f"🔍 arxiv 未检索到: {query} (category={category or '不限'}{extra})"
-        out = [f"arxiv 检索 '{query}' (cat={category or '不限'}) 命中 {len(results)} 篇：\n"]
+            return f"🔍 arxiv 未检索到: {query} (category={category or '不限'}{extra})\n检索式: {q}"
+        out = [f"arxiv 检索 '{query}' (cat={category or '不限'}) 命中 {len(results)} 篇（按 {sort_name} 排序）：\n"]
         for r in results:
             out.append(self._fmt(r))
         out.append("\n下一步：arxiv[action=download, arxiv_id=<id>, topic=<主题库>] 下载，再 paper_rag[action=index] 入库。")
@@ -168,7 +211,30 @@ class ArxivTool(Tool):
         topic_dir = self.papers_root / topic
         topic_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{r.get_short_id().replace('/', '_')}.pdf"
-        path = r.download_pdf(dirpath=str(topic_dir), filename=filename)
+        path = topic_dir / filename
+        # arxiv 包内部用 urllib + 系统默认 CA，在部分环境（如 Windows 上
+        # OpenSSL 只认不到 cert.pem 时）会 CERTIFICATE_VERIFY_FAILED。
+        # 这里优先用 requests（自带 certifi），失败再回退到 arxiv 自带下载。
+        try:
+            import requests
+            resp = requests.get(
+                r.pdf_url, timeout=120,
+                headers={"User-Agent": "HelloAcademicAgent/arxiv-downloader"},
+            )
+            resp.raise_for_status()
+            if not (resp.content or b"").startswith(b"%PDF"):
+                raise RuntimeError("返回内容不是 PDF（可能是限流页）")
+            path.write_bytes(resp.content)
+            path = str(path)
+        except Exception as dl_err:
+            try:
+                path = r.download_pdf(dirpath=str(topic_dir), filename=filename)
+            except Exception as second_err:
+                return (
+                    f"❌ 下载失败: {dl_err}\n"
+                    f"    回退 arxiv 自带下载也失败: {second_err}\n"
+                    f"    提示: 证书校验问题可尝试设置环境变量 SSL_CERT_FILE=<certifi 的 cacert.pem 路径>"
+                )
         return (
             f"✅ 已下载: {path}\n主题库: {topic}\n标题: {r.title}\n"
             f"下一步: paper_rag[action=index, paths=[\"{path}\"], topic=\"{topic}\"]"

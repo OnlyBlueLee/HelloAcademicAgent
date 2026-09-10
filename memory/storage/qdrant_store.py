@@ -14,9 +14,13 @@ from datetime import datetime
 try:
     from qdrant_client import QdrantClient
     from qdrant_client.http import models
+    # 注意：不要 import models.SearchRequest —— qdrant-client >= 1.13 已移除该名字，
+    # 且本模块搜索走 client.query_points，并不需要它。把它放进本 import 块时，
+    # 一个未使用的名字会让整块抛 ImportError，QDRANT_AVAILABLE 被误判为 False，
+    # 导致 paper_rag 全链路报"qdrant-client未安装"。
     from qdrant_client.http.models import (
-        Distance, VectorParams, PointStruct, 
-        Filter, FieldCondition, MatchValue, SearchRequest
+        Distance, VectorParams, PointStruct,
+        Filter, FieldCondition, MatchValue
     )
     QDRANT_AVAILABLE = True
 except ImportError:
@@ -30,7 +34,33 @@ class QdrantConnectionManager:
     """Qdrant连接管理器 - 防止重复连接和初始化"""
     _instances = {}  # key: (url, collection_name) -> QdrantVectorStore instance
     _lock = threading.Lock()
-    
+    _atexit_registered = False
+
+    @classmethod
+    def _register_atexit(cls) -> None:
+        """在解释器关闭前主动关闭本地客户端。
+
+        qdrant_client 的 QdrantClient.__del__ 会在解释器 teardown 阶段运行，
+        此时 sys.meta_path 已为 None，本地模式的 close() 会抛
+        "ImportError: sys.meta_path is None"，在每次 CLI 退出时打印一段
+        看似严重的 traceback。用 atexit（早于模块 teardown 执行）提前关闭即可避免。
+        """
+        if cls._atexit_registered:
+            return
+        import atexit
+
+        def _close_all() -> None:
+            for store in list(cls._instances.values()):
+                try:
+                    client = getattr(store, "client", None)
+                    if client is not None and hasattr(client, "close"):
+                        client.close()
+                except Exception:
+                    pass
+
+        atexit.register(_close_all)
+        cls._atexit_registered = True
+
     @classmethod
     def get_instance(
         cls, 
@@ -43,6 +73,7 @@ class QdrantConnectionManager:
         **kwargs
     ) -> 'QdrantVectorStore':
         """获取或创建Qdrant实例（单例模式）"""
+        cls._register_atexit()
         # 创建唯一键
         key = (url or "local", collection_name)
         
@@ -269,7 +300,16 @@ class QdrantVectorStore:
             if not vectors:
                 logger.warning("⚠️ 向量列表为空")
                 return False
-                
+
+            # 长度必须严格对齐：这里过去靠 zip() 静默截断，会把
+            # “N 个片段只写入少数几个点”伪装成成功（其余片段直接丢失）。
+            if len(metadata) != len(vectors):
+                logger.error(f"❌ 向量与元数据数量不一致: vectors={len(vectors)} metadata={len(metadata)}")
+                return False
+            if ids is not None and len(ids) != len(vectors):
+                logger.error(f"❌ 向量与ID数量不一致: vectors={len(vectors)} ids={len(ids)}")
+                return False
+
             # 生成ID（如果未提供）
             if ids is None:
                 ids = [f"vec_{i}_{int(datetime.now().timestamp() * 1000000)}" 

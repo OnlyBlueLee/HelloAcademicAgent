@@ -20,6 +20,7 @@ from tools.builtin.arxiv_tool import ArxivTool
 from tools.builtin.paper_rag_tool import PaperRagTool
 from tools.builtin.subagent_tool import SubAgentTool
 from code_agent.modes import ModeManager, SessionState, MODES, SUBAGENTS
+from utils.topic import sanitize_topic
 
 
 
@@ -184,7 +185,9 @@ class CodeAgent:
                     {"role": "system", "content": summarize_prompt},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=400,
+                # 推理型模型(deepseek-v4-flash 等)的 reasoning token 计入 max_tokens，
+                # 预算太小会整段返回空，导致摘要静默丢失。
+                max_tokens=1200,
             ) or ""
 
         self.react = ReActAgent(
@@ -220,7 +223,7 @@ class CodeAgent:
 
     def set_topic(self, topic: str) -> str:
         """切换当前主题库（paper_rag / arxiv 的默认 namespace）。"""
-        t = (topic or "").strip()
+        t = sanitize_topic(topic, fallback="")
         if not t:
             return "⚠️ 主题库名不能为空。用法: /lib <topic>"
         self.session_state.current_topic = t

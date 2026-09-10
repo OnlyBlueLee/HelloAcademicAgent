@@ -477,6 +477,64 @@ def _create_default_vector_store(dimension: int = None) -> QdrantVectorStore:
 # Cache functions removed - using unified embedder with internal caching
 
 
+# DashScope text-embedding-v3 单次输入上限为 10 条，超过会整批返回空。
+# 此前 index_chunks 默认 batch_size=64，任何真实论文(>10 块)都会编码失败；
+# 失败兜底又按“异常次数”补零向量，配合 add_vectors 的 zip 静默截断，
+# 最终落库的是少量零向量 —— 检索失真却不报错。这里统一钳制并保证 1:1。
+EMBED_MAX_BATCH = max(1, int(os.getenv("EMBED_MAX_BATCH", "10")))
+
+
+def _normalize_embedding_output(raw: Any, expected: int) -> Optional[List[List[float]]]:
+    """把 embedder 返回值规范成 List[List[float]]；数量不符时返回 None。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raw = list(raw) if hasattr(raw, "__len__") else [raw]
+        if expected == 1:
+            raw = [raw]
+    out: List[List[float]] = []
+    for v in raw:
+        if hasattr(v, "tolist"):
+            v = v.tolist()
+        if isinstance(v, list) and v and isinstance(v[0], (list, tuple)):
+            v = v[0]
+        try:
+            out.append([float(x) for x in v])
+        except Exception:
+            return None
+    return out if len(out) == expected else None
+
+
+def _encode_one_batch(embedder, batch: List[str], dimension: int) -> List[List[float]]:
+    try:
+        vecs = _normalize_embedding_output(embedder.encode(batch), len(batch))
+        if vecs is None:
+            raise ValueError("嵌入返回数量与输入不一致")
+        for v in vecs:
+            if len(v) != dimension:
+                raise ValueError(f"向量维度异常: 期望{dimension}, 实际{len(v)}")
+        return vecs
+    except Exception as e:
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            print(f"[WARNING] 批次编码失败({len(batch)}条)，拆分重试: {e}")
+            return _encode_one_batch(embedder, batch[:mid], dimension) + \
+                   _encode_one_batch(embedder, batch[mid:], dimension)
+        raise RuntimeError(f"Embedding 编码失败（单条仍失败）: {e}")
+
+
+def _encode_texts(embedder, texts: List[str], dimension: int,
+                  max_batch: int = EMBED_MAX_BATCH) -> List[List[float]]:
+    """编码 texts，返回与之严格一一对应的向量。
+
+    失败时向上抛错，绝不静默补零向量（零向量会让检索结果失真且无告警）。
+    """
+    result: List[List[float]] = []
+    for start in range(0, len(texts), max_batch):
+        result.extend(_encode_one_batch(embedder, texts[start:start + max_batch], dimension))
+    return result
+
+
 def index_chunks(
     store = None, 
     chunks: List[Dict] = None, 
@@ -510,101 +568,12 @@ def index_chunks(
     
     print(f"[RAG] Embedding start: total_texts={len(processed_texts)} batch_size={batch_size}")
     
-    # Batch encoding with unified embedder
-    vecs: List[List[float]] = []
-    for i in range(0, len(processed_texts), batch_size):
-        part = processed_texts[i:i+batch_size]
-        try:
-            # Use unified embedder directly (handles caching internally)
-            part_vecs = embedder.encode(part)
-            
-            # Normalize to List[List[float]]
-            if not isinstance(part_vecs, list):
-                # 单个numpy数组转为列表中的列表
-                if hasattr(part_vecs, "tolist"):
-                    part_vecs = [part_vecs.tolist()]
-                else:
-                    part_vecs = [list(part_vecs)]
-            else:
-                # 检查是否是嵌套列表
-                if part_vecs and not isinstance(part_vecs[0], (list, tuple)) and hasattr(part_vecs[0], "__len__"):
-                    # numpy数组列表 -> 转换每个数组
-                    normalized_vecs = []
-                    for v in part_vecs:
-                        if hasattr(v, "tolist"):
-                            normalized_vecs.append(v.tolist())
-                        else:
-                            normalized_vecs.append(list(v))
-                    part_vecs = normalized_vecs
-                elif part_vecs and not isinstance(part_vecs[0], (list, tuple)):
-                    # 单个向量被误判为列表，实际应该包装成[[...]]
-                    if hasattr(part_vecs, "tolist"):
-                        part_vecs = [part_vecs.tolist()]
-                    else:
-                        part_vecs = [list(part_vecs)]
-            
-            for v in part_vecs:
-                try:
-                    # 确保向量是float列表
-                    if hasattr(v, "tolist"):
-                        v = v.tolist()
-                    v_norm = [float(x) for x in v]
-                    if len(v_norm) != dimension:
-                        print(f"[WARNING] 向量维度异常: 期望{dimension}, 实际{len(v_norm)}")
-                        # 用零向量填充或截断
-                        if len(v_norm) < dimension:
-                            v_norm.extend([0.0] * (dimension - len(v_norm)))
-                        else:
-                            v_norm = v_norm[:dimension]
-                    vecs.append(v_norm)
-                except Exception as e:
-                    print(f"[WARNING] 向量转换失败: {e}, 使用零向量")
-                    vecs.append([0.0] * dimension)
-                
-        except Exception as e:
-            print(f"[WARNING] Batch {i} encoding failed: {e}")
-            print(f"[RAG] Retrying batch {i} with smaller chunks...")
-            
-            # 尝试重试：将批次分解为更小的块
-            success = False
-            for j in range(0, len(part), 8):  # 更小的批次
-                small_part = part[j:j+8]
-                try:
-                    import time
-                    time.sleep(2)  # 等待2秒避免频率限制
-                    
-                    small_vecs = embedder.encode(small_part)
-                    # Normalize to List[List[float]]
-                    if isinstance(small_vecs, list) and small_vecs and not isinstance(small_vecs[0], list):
-                        small_vecs = [small_vecs]
-                    
-                    for v in small_vecs:
-                        if hasattr(v, "tolist"):
-                            v = v.tolist()
-                        try:
-                            v_norm = [float(x) for x in v]
-                            if len(v_norm) != dimension:
-                                print(f"[WARNING] 向量维度异常: 期望{dimension}, 实际{len(v_norm)}")
-                                if len(v_norm) < dimension:
-                                    v_norm.extend([0.0] * (dimension - len(v_norm)))
-                                else:
-                                    v_norm = v_norm[:dimension]
-                            vecs.append(v_norm)
-                            success = True
-                        except Exception as e2:
-                            print(f"[WARNING] 小批次向量转换失败: {e2}")
-                            vecs.append([0.0] * dimension)
-                except Exception as e2:
-                    print(f"[WARNING] 小批次 {j//8} 仍然失败: {e2}")
-                    # 为这个小批次创建零向量
-                    for _ in range(len(small_part)):
-                        vecs.append([0.0] * dimension)
-            
-            if not success:
-                print(f"[ERROR] 批次 {i} 完全失败，使用零向量")
-        
-        print(f"[RAG] Embedding progress: {min(i+batch_size, len(processed_texts))}/{len(processed_texts)}")
-    
+    # Batch encoding with unified embedder。
+    # 钳制批次上限：DashScope text-embedding-v3 单次 <=10，超过会整批返回空。
+    effective_batch = max(1, min(int(batch_size or EMBED_MAX_BATCH), EMBED_MAX_BATCH))
+    vecs: List[List[float]] = _encode_texts(embedder, processed_texts, dimension, effective_batch)
+    print(f"[RAG] Embedding progress: {len(vecs)}/{len(processed_texts)}")
+
     # Prepare metadata with RAG tags
     metas: List[Dict] = []
     ids: List[str] = []
@@ -623,6 +592,12 @@ def index_chunks(
         metas.append(meta)
         ids.append(ch["id"])
     
+    # 落库前再断言一次：向量、元数据、ID 必须严格一一对应，
+    # 否则宁可报错也不要“写入部分数据却显示成功”。
+    if not (len(vecs) == len(metas) == len(ids)):
+        raise RuntimeError(
+            f"向量/元数据/ID 数量不一致: vectors={len(vecs)} metas={len(metas)} ids={len(ids)}"
+        )
     print(f"[RAG] Qdrant upsert start: n={len(vecs)}")
     success = store.add_vectors(vectors=vecs, metadata=metas, ids=ids)
     if success:
@@ -635,37 +610,31 @@ def index_chunks(
 def embed_query(query: str) -> List[float]:
     """
     Embed query using unified embedding (百炼 with fallback).
+
+    失败时抛错而非返回零向量：零向量与任何片段的相似度都是 0，
+    会得到“检索到结果但全无关联”的假象。
     """
     embedder = get_text_embedder()
     dimension = get_dimension(384)
-    try:
-        vec = embedder.encode(query)
-        
-        # Normalize to List[float]
-        if hasattr(vec, "tolist"):
-            vec = vec.tolist()
-        
-        # 处理嵌套列表情况
-        if isinstance(vec, list) and vec and isinstance(vec[0], (list, tuple)):
-            vec = vec[0]  # Extract first vector if nested
-        
-        # 转换为float列表
-        result = [float(x) for x in vec]
-        
-        # 检查维度
-        if len(result) != dimension:
-            print(f"[WARNING] Query向量维度异常: 期望{dimension}, 实际{len(result)}")
-            # 用零向量填充或截断
-            if len(result) < dimension:
-                result.extend([0.0] * (dimension - len(result)))
-            else:
-                result = result[:dimension]
-        
-        return result
-    except Exception as e:
-        print(f"[WARNING] Query embedding failed: {e}")
-        # Return zero vector as fallback
-        return [0.0] * dimension
+
+    vec = embedder.encode(query)
+
+    # Normalize to List[float]
+    if hasattr(vec, "tolist"):
+        vec = vec.tolist()
+
+    # 处理嵌套列表情况
+    if isinstance(vec, list) and vec and isinstance(vec[0], (list, tuple)):
+        vec = vec[0]
+
+    # 转换为float列表
+    result = [float(x) for x in vec]
+
+    # 检查维度
+    if len(result) != dimension:
+        raise ValueError(f"Query向量维度异常: 期望{dimension}, 实际{len(result)}")
+
+    return result
 
 
 def search_vectors(

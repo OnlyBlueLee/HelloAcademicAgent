@@ -163,6 +163,7 @@ CLI 参数只有 `--repo` 与 `--project`，其余全部走 `.env` / 环境变�
 | `/paper` `/research` `/code` | 切换模式（换系统提示词 + 工具子集） |
 | `/lib <topic>` | 切换当前主题库（arxiv 下载目录、RAG 检索范围随之改变） |
 | `/status` | 查看当前模式与主题库 |
+| `/doctor` | 健康自检：LLM 非空应答、embedding、向量库、PDF 解析、各主题库零向量巡检 |
 | `/plan <目标>` | 强制生成一份执行计划（不依赖当前模式是否注册 plan 工具） |
 | `/help` | 帮助 + 各模式说明 |
 | `/quit`（`/q` `exit` `:q`） | 退出 |
@@ -238,6 +239,7 @@ CLI 参数只有 `--repo` 与 `--project`，其余全部走 `.env` / 环境变�
 | `QDRANT_HNSW_M` / `QDRANT_HNSW_EF_CONSTRUCT` / `QDRANT_SEARCH_EF` / `QDRANT_SEARCH_EXACT` | `32` / `256` / `128` / `0` | `qdrant_store.py` | 向量索引与检索参数 |
 | `EMBED_MODEL_TYPE` | `dashscope` | `memory/embedding.py` | `dashscope`（1024 维）/ `local` sentence-transformers（384 维） |
 | `EMBED_MODEL_NAME` / `EMBED_API_KEY` / `EMBED_BASE_URL` | 按后端 | `memory/embedding.py` | 覆盖 embedding 模型与端点 |
+| `EMBED_MAX_BATCH` | `10` | `memory/rag/pipeline.py` | embedding 单批上限；dashscope `text-embedding-v3` 单次 ≤10，设为超过该值会导致整批失败 |
 
 补丁可改后缀白名单由 `ApplyPatchExecutor.allowed_write_suffixes` 决定（CLI 未传参，用内置默认）：
 `.py .md .toml .json .yml .yaml .txt .html .htm .css .js`。
@@ -308,17 +310,23 @@ HelloAcademicAgent/
 ## 已知限制与排错
 
 **验证状态**：本文描述的是代码当前实现（逐处核对过 config / 工具参数 / 执行器与 CLI 判定逻辑）。
-已在本地环境实跑验证：`/research` 检索（含 `sort_by=SubmittedDate` 按时间排序）、arxiv 下载、PDF 解析（`markitdown[pdf]`）链路；`/paper` 引用问答与 `/code` 补丁落盘按排错表自查即可。
+已在本地环境实跑验证：`/research` 检索（含 `sort_by=SubmittedDate` 按时间排序）、arxiv 下载、PDF 解析（`markitdown[pdf]`）、`/paper` 引用问答、`/research` 下载→入库闭环、`/doctor` 自检；`/code` 补丁落盘按排错表自查即可。
 
 | 现象 | 原因 / 处理 |
 |---|---|
 | 换 embedding 后端后检索报错或结果异常 | 维度不一致（dashscope 1024 / local 384）。删掉 `.helloagents/qdrant/` 后重新 `paper_rag[action=index]` 全量重建——这会**清空已入库向量**，PDF 本身还在 `papers/` |
 | 提示连不上 `localhost:6333` | 说明这次调用没走嵌入式路径：检查是否设了 `QDRANT_URL`，或该调用来自未传 `local_path` 的旧入口（`paper_rag` 已默认传）。否则就起一个服务：`docker run -p 6333:6333 qdrant/qdrant` |
 | 嵌入式 Qdrant 报文件锁被占用 | 本地模式是**单进程独占**，不要同时开两个 CLI 实例 |
+| `paper_rag` 报"qdrant-client未安装"但确实装了 | qdrant-client 大版本升级曾移除 `models.SearchRequest` 等名字。已修：import 只保留实际使用的符号；若换其他版本仍报此错，用 `/doctor` 定位，并按 `require` 里的版本区间装 `qdrant-client` |
+| 入库显示成功、但检索永远无命中 | 多为**零向量**：embedding 批次超限（dashscope `text-embedding-v3` 单次 ≤10）会让整批失败并曾静默补零。已修（批次钳制到 `EMBED_MAX_BATCH`，失败即报错）。用 `/doctor` 看主题库向量范数，有零向量就重新 `index` |
+| arxiv 下载报 `CERTIFICATE_VERIFY_FAILED` | 已修：下载改走 `requests`（自带 certifi），失败才回退 arxiv 自带 urllib。若仍失败，设 `SSL_CERT_FILE=<certifi>/cacert.pem` |
+| 检索结果与关键词毫不相关 | 此前把自然语言原样拼进 `cat:X AND (query)`，配时间排序会捞出大量无关最新投稿。已修：逐词加引号 + AND 连接（`build_arxiv_query`）；已含 arxiv 语法的输入原样透传 |
 | `LLM 预检失败` | `.env` 里 key / `LLM_BASE_URL` / `LLM_MODEL_ID` 三者不匹配（模型名要用 provider 侧真实存在的 id） |
+| 预检通过但模型/摘要偶发"空回复" | 推理型模型（如 `deepseek-v4-flash`）的 reasoning token 计入 `max_tokens`，预算太小会整段返回空。预检与摘要预算已上调；自建调用请留足 ≥512 |
 | `所有嵌入模型都不可用` | 对应后端未安装或未配 key；`pip install dashscope` 或 `sentence-transformers` |
 | tfidf embedding 建不了索引 | 已知限制：索引路径不训练 tfidf，**不要**把 `EMBED_MODEL_TYPE` 设成 `tfidf` |
 | 论文没入库就问答，答不出东西 | `paper_rag` 只检索已索引内容。先在 `/research` 下载入库，或手动 `index` 本地 PDF |
+| 同一方向"下载在这、检索在那" | topic 会被统一清洗（`utils/topic.py`），`/lib`、`arxiv`、`paper_rag` 三处一致。跨会话请用 `/lib <topic>` 固定并保持 `index`/`ask` 的 topic 相同 |
 | 补丁被拒 | 目标后缀不在执行器白名单（报 `Disallowed file suffix`），或被判高风险后你在确认环节选了 `n` → 换后缀或拆成多个小补丁 |
 | 复现跑不通 | 属预期：论文常省略超参/预处理细节。看 spec 的「缺口与假设」逐条与用户确认 |
 
