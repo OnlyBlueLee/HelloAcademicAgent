@@ -8,8 +8,13 @@ requests>=2.28.0              # arxiv 下载 / dashscope REST embedding 直接�
 # ===== 科研 RAG（paper_rag 工具：PDF→分块→向量库→检索/问答）=====
 qdrant-client>=1.10,<2.0     # 下限 query_points（本仓库检索走它）；上限防未来破坏性变更
 markitdown[pdf]>=0.0.1       # [pdf] extra 必需：裸装 markitdown 无法解析 PDF（会静默走乱码兜底）
+pypdfium2>=4.30.0            # 本地 PDF 解析兜底（MinerU 不可用时使用），无需 torch
 numpy>=1.24
 langdetect>=1.0.9
+
+# PDF 解析：默认走 MinerU 云端 API（免登录，见 memory/rag/mineru_client.py），无需本地安装。
+# 如需完全离线/不外传，设 MINERU_ENABLED=0 即回退到 pypdfium2 / markitdown。
+# 如需合并部署（解析也在本机、体积大且需 torch），自行安装：pip install "mineru[pipeline]"
 
 # embedding 后端二选一（同一向量库 collection 必须固定一个后端）：
 dashscope>=1.20.0            # 轻量：走百炼 API，免装 torch（本地试用推荐）

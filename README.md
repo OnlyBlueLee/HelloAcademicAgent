@@ -75,7 +75,9 @@
 **关键实现点**
 
 - **ReAct 引擎**（`agents/react_agent.py`）：严格 `Thought:` / `Action:` 两段式；解析失败会强制一次格式修复重试；支持重复动作早停、步数耗尽时兜底收敛（finalize）。
-- **RAG 流水线**（`memory/rag/pipeline.py`）：MarkItDown 转 markdown → 标题感知段落分块（带 `heading_path` 与字符区间）→ 向量入库 → 检索时可选 MQE/HyDE 查询扩展 → `compute_graph_signals_from_pool` + `rank`（向量 0.7 / 同篇邻近 0.3 融合）→ `merge_snippets_grouped` 输出 `[n]` 引用与 References。
+- **RAG 流水线**（`memory/rag/pipeline.py`）：PDF 解析（MinerU 云端 → pypdfium2 → markitdown 三级降级）→ 标题感知段落分块（带 `heading_path` 与字符区间）→ 向量入库 → 检索时可选 MQE/HyDE 查询扩展 → `compute_graph_signals_from_pool` + `rank`（向量 0.7 / 同篇邻近 0.3 融合）→ `merge_snippets_grouped` 输出 `[n]` 引用与 References。
+- **PDF 解析**（`memory/rag/mineru_client.py`）：默认走 **MinerU 云端 API**（免登录，双栏版面还原正确、保留公式与标题层级，实测表格噪声 1% vs markitdown 38%）。配有 token 时自动升级到精确解析 API（≤200MB/200 页）；失败则回退本地 `pypdfium2`，再回退 markitdown。解析结果按文件哈希缓存到 `.helloagents/pdf_cache/`，同一 PDF 不会重复上传。
+  > ⚠️ 云端解析会把 PDF 上传到 mineru.net。未发表/涉密论文请设 `MINERU_ENABLED=0` 走本地解析。
 - **向量库**：Qdrant **嵌入式本地模式**（`QdrantClient(path=...)`），免 Docker；经 `QdrantConnectionManager` 按 `(url, collection)` 单例复用，避免文件锁冲突。设置 `QDRANT_URL` 即切回服务端/云模式。
 - **子 Agent**（`tools/builtin/subagent_tool.py`）：与主 Agent 共享同一批工具实例和同一份 `react.md` 模板，但只暴露 `SubAgentSpec.tool_names` 白名单，步数受 `max_steps` 限制。白名单不含 `terminal`/补丁 → 天然无递归、权限收敛。
 
@@ -240,6 +242,13 @@ CLI 参数只有 `--repo` 与 `--project`，其余全部走 `.env` / 环境变�
 | `EMBED_MODEL_TYPE` | `dashscope` | `memory/embedding.py` | `dashscope`（1024 维）/ `local` sentence-transformers（384 维） |
 | `EMBED_MODEL_NAME` / `EMBED_API_KEY` / `EMBED_BASE_URL` | 按后端 | `memory/embedding.py` | 覆盖 embedding 模型与端点 |
 | `EMBED_MAX_BATCH` | `10` | `memory/rag/pipeline.py` | embedding 单批上限；dashscope `text-embedding-v3` 单次 ≤10，设为超过该值会导致整批失败 |
+| `MINERU_ENABLED` | `1` | `memory/rag/mineru_client.py` | 是否用 MinerU 云端解析 PDF；设 `0` 则完全本地（不外传） |
+| `MINERU_API_TOKEN` | 空 | `mineru_client` | 留空用免登录 Agent API（≤10MB）；填了自动升级精确 API v4（≤200MB/200 页） |
+| `MINERU_LANGUAGE` / `MINERU_MODEL_VERSION` | `ch` / `pipeline` | `mineru_client` | OCR 语言 / 精确 API 模型版本（可 `vlm`） |
+| `MINERU_TIMEOUT` / `MINERU_POLL_INTERVAL` | `600` / `3` | `mineru_client` | 单文件解析总超时（秒）/ 轮询间隔（秒） |
+| `MINERU_AGENT_MAX_MB` | `10` | `mineru_client` | 免登录 API 的文件大小上限（MB），超过则跳过云端 |
+| `MINERU_CACHE_DIR` | `.helloagents/pdf_cache` | `mineru_client` | 解析结果缓存目录（按 PDF 哈希） |
+| `MINERU_SSL_VERIFY` | `1` | `mineru_client` | TLS 校验；证书链不全的环境可设 `0` |
 
 补丁可改后缀白名单由 `ApplyPatchExecutor.allowed_write_suffixes` 决定（CLI 未传参，用内置默认）：
 `.py .md .toml .json .yml .yaml .txt .html .htm .css .js`。

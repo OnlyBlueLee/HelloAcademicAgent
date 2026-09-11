@@ -1,5 +1,6 @@
 from typing import List, Dict, Optional, Any
 import os
+import re
 import hashlib
 import sqlite3
 import time
@@ -46,17 +47,74 @@ def _is_markitdown_supported_format(path: str) -> bool:
     return ext in supported_formats
 
 
+def _try_mineru(path: str) -> str:
+    """尝试用 MinerU 云端解析 PDF；不可用/失败返回空串。
+
+    MinerU 直接输出结构化 markdown（标题/公式/表格），无需再做文本重组。
+    """
+    try:
+        from .mineru_client import parse_pdf, is_enabled
+    except Exception as e:  # noqa: BLE001
+        print(f"[RAG] MinerU 模块不可用: {e}")
+        return ""
+    if not is_enabled():
+        return ""
+    try:
+        md = parse_pdf(path)
+    except Exception as e:  # noqa: BLE001
+        print(f"[RAG] MinerU 解析异常，回退本地: {type(e).__name__}: {e}")
+        return ""
+    if md and md.strip():
+        print(f"[RAG] MinerU 解析完成: {len(md)} chars")
+        return md
+    return ""
+
+
+def _local_pdf_extract(path: str) -> str:
+    """本地 pypdfium2 抽文本（无需联网）；不可用时返回空串。"""
+    try:
+        import pypdfium2 as pdfium
+    except Exception:
+        return ""
+    try:
+        pdf = pdfium.PdfDocument(path)
+        try:
+            parts = [pg.get_textpage().get_text_range() for pg in pdf]
+        finally:
+            pdf.close()
+        text = "\n".join(parts)
+    except Exception as e:  # noqa: BLE001
+        print(f"[RAG] pypdfium2 解析失败: {e}")
+        return ""
+    if not text.strip():
+        return ""
+    # pypdfium2 把跨行连字符输出为 U+FFFE，还原为连字符
+    text = text.replace("\ufffe", "-")
+    print(f"[RAG] 本地解析(pypdfium2)完成: {len(text)} chars")
+    return text
+
+
 def _convert_to_markdown(path: str) -> str:
     """
-    Universal document reader using MarkItDown with enhanced PDF processing.
-    Converts any supported file format to markdown text.
+    Universal document reader.
+
+    PDF 走三级降级：MinerU 云端 API → 本地 pypdfium2 → markitdown。
+    其他格式仍用 MarkItDown。
     """
     if not os.path.exists(path):
         return ""
-    
-    # 对PDF文件使用增强处理
+
     ext = (os.path.splitext(path)[1] or '').lower()
     if ext == '.pdf':
+        # 1) MinerU 云端（版面还原最好；已输出干净 markdown，不再走 _post_process_pdf_text）
+        md = _try_mineru(path)
+        if md:
+            return md
+        # 2) 本地 pypdfium2（无网络依赖，版面还原优于 markitdown）
+        local = _local_pdf_extract(path)
+        if local:
+            return local
+        # 3) markitdown 兜底
         return _enhanced_pdf_processing(path)
     
     # 其他格式使用原有MarkItDown
@@ -269,7 +327,67 @@ def _split_paragraphs_with_headings(text: str) -> List[Dict]:
     return paragraphs
 
 
+def _split_oversized_paragraph(p: Dict, max_tokens: int) -> List[Dict]:
+    """把超过 max_tokens 的单个段落按句/词边界切小。
+
+    必要性：纯文本 PDF（如 pypdfium2 输出）段落内几乎没有空行，整页会被当成
+    一个"段落"；若直接送入 `_chunk_paragraphs`，其 `or not cur` 分支会让超大段落
+    整块成为一个 chunk，进而超出 embedding API 的单条输入上限（DashScope 会返回空）。
+    """
+    content = p["content"]
+    if _approx_token_len(content) <= max_tokens:
+        return [p]
+
+    heading = p.get("heading_path")
+    base_start = p.get("start", 0)
+    # 先按句子边界切，再按空白兜底，最后按硬字符数切
+    pieces: List[str] = []
+    sent_split = re.split(r"(?<=[.!?。！？])\s+", content)
+    buf: List[str] = []
+    buf_tokens = 0
+    for s in sent_split:
+        s_tokens = _approx_token_len(s) or 1
+        if buf and buf_tokens + s_tokens > max_tokens:
+            pieces.append(" ".join(buf))
+            buf, buf_tokens = [], 0
+        if s_tokens > max_tokens:
+            # 单个句子仍超长：按空白词推进，必要时硬切
+            words = s.split()
+            wbuf: List[str] = []
+            for w in words:
+                if wbuf and _approx_token_len(" ".join(wbuf + [w])) > max_tokens:
+                    pieces.append(" ".join(wbuf))
+                    wbuf = []
+                wbuf.append(w)
+            if wbuf:
+                pieces.append(" ".join(wbuf))
+        else:
+            buf.append(s)
+            buf_tokens += s_tokens
+    if buf:
+        pieces.append(" ".join(buf))
+
+    out: List[Dict] = []
+    cursor = base_start
+    for piece in pieces:
+        if not piece.strip():
+            continue
+        out.append({
+            "content": piece,
+            "heading_path": heading,
+            "start": cursor,
+            "end": cursor + len(piece),
+        })
+        cursor += len(piece) + 1
+    return out or [p]
+
+
 def _chunk_paragraphs(paragraphs: List[Dict], chunk_tokens: int, overlap_tokens: int) -> List[Dict]:
+    # 先展开超大段落，保证任何单个元素都不超过 chunk_tokens
+    expanded: List[Dict] = []
+    for p in paragraphs:
+        expanded.extend(_split_oversized_paragraph(p, chunk_tokens))
+    paragraphs = expanded
     chunks: List[Dict] = []
     cur: List[Dict] = []
     cur_tokens = 0

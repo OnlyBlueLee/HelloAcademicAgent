@@ -128,13 +128,25 @@ def _run_doctor(agent, llm) -> None:
         ok = False
         print(c(f"  ❌ 向量库导入失败: {e}", ERROR))
 
-    # 4) PDF 解析依赖
+    # 4) PDF 解析：MinerU 云端优先，本地 pypdfium2 / markitdown 兜底
+    try:
+        from memory.rag.mineru_client import describe as _mineru_describe, is_enabled as _mineru_on
+        if _mineru_on():
+            print(c(f"  ℹ️ PDF 解析: MinerU {_mineru_describe()}（论文会上传至 mineru.net）", INFO))
+        else:
+            print(c(f"  ℹ️ PDF 解析: {_mineru_describe()}", INFO))
+    except Exception as e:
+        print(c(f"  ⚠️ MinerU 客户端不可用: {e}", WARN))
+    try:
+        import pypdfium2  # noqa: F401
+        print(c("  ✅ 本地 PDF 解析(pypdfium2)可用", INFO))
+    except Exception:
+        print(c("  ⚠️ pypdfium2 未安装：MinerU 失败时无本地兜底", WARN))
     try:
         from markitdown import MarkItDown  # noqa: F401
-        print(c("  ✅ PDF/文档解析(markitdown)可用", INFO))
+        print(c("  ✅ 文档解析(markitdown)可用", INFO))
     except Exception:
-        ok = False
-        print(c("  ❌ markitdown 未安装：PDF 将无法解析（pip install 'markitdown[pdf]'）", ERROR))
+        print(c("  ⚠️ markitdown 未安装：非 PDF 文档可能无法解析", WARN))
 
     # 5) 各主题库的向量健康度：零向量意味着"入库成功但检索必失真"
     try:
